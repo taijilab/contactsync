@@ -63,9 +63,40 @@ def init_db() -> None:
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS conflict_log (
+                conflict_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                local_id TEXT NOT NULL,
+                contact_id TEXT,
+                conflict_type TEXT NOT NULL,
+                local_payload TEXT NOT NULL,
+                server_payload TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                resolved_payload TEXT,
+                created_at TEXT NOT NULL,
+                resolved_at TEXT
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS contact_history (
+                history_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                contact_id TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                snapshot TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_contacts_user_updated ON contacts(user_id, updated_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_contacts_user_deleted ON contacts(user_id, deleted_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_sync_ack_user_device ON sync_ack_log(user_id, device_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_conflict_user_status ON conflict_log(user_id, status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_history_contact_version ON contact_history(contact_id, version)")
         conn.commit()
     finally:
         conn.close()

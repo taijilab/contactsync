@@ -1,6 +1,6 @@
 # CloudSyncContacts v0.1
 
-基于规格书 `v0.1 + v0.2` 的可运行后端实现。
+基于规格书 `v0.1 + v0.2 + v0.3` 的可运行后端实现。
 
 ## 已实现能力
 - `POST /api/v1/auth/register` 用户注册（邮箱/手机号 + 密码）
@@ -11,6 +11,10 @@
 - `POST /api/v1/sync` 双向同步（提交本地变更 + 返回服务端变更 + 冲突列表）
 - `GET /api/v1/sync/changes?since={ts}&device_id={id}` 拉取增量变更
 - `POST /api/v1/sync/ack` 确认客户端已应用变更
+- `GET /api/v1/conflicts` 查询冲突列表（open/resolved/all）
+- `POST /api/v1/conflicts/{conflict_id}/resolve` 冲突解决（保留本地/保留云端/手动合并）
+- `GET /api/v1/contacts/{id}/history` 查询联系人历史快照
+- `POST /api/v1/contacts/{id}/rollback` 回滚到指定历史版本
 - `GET /health` 健康检查
 
 ## 本地运行
@@ -45,6 +49,6 @@ curl -sS "http://127.0.0.1:8000/api/v1/contacts?page=1&page_size=20" \
 ```
 
 ## 注意
-- 当前为 v0.2 后端可验证版本，未包含 iOS/Android 客户端实现。
+- 当前为 v0.3 后端可验证版本，未包含 iOS/Android 客户端实现。
 - 数据库使用 SQLite（`contactsync.db`）以便快速启动；后续可迁移到 PostgreSQL。
 - Token 使用 HS256 JWT 自实现，生产环境建议改为成熟库并加入 refresh token/密钥轮换。

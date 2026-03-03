@@ -85,12 +85,23 @@ class SyncAckRequest(BaseModel):
     acked_until: str
 
 
+class ResolveConflictRequest(BaseModel):
+    strategy: str = Field(pattern="^(keep_local|keep_server|manual_merge)$")
+    merged_contact: Optional[SyncChange] = None
+    device_id: str = Field(min_length=1, max_length=128)
+
+
+class RollbackRequest(BaseModel):
+    history_id: str = Field(min_length=1)
+    device_id: str = Field(min_length=1, max_length=128)
+
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "Bearer"
 
 
-app = FastAPI(title="CloudSyncContacts v0.2", version="0.2.0")
+app = FastAPI(title="CloudSyncContacts v0.3", version="0.3.0")
 init_db()
 
 
@@ -221,6 +232,83 @@ def serialize_contact(row: sqlite3.Row) -> Dict[str, Any]:
     }
 
 
+def row_to_sync_change(row: sqlite3.Row, op_override: Optional[str] = None) -> Dict[str, Any]:
+    payload = {
+        "op": op_override or ("delete" if row["deleted_at"] else "upsert"),
+        "local_id": row["local_id"],
+        "display_name": row["display_name"] or "",
+        "given_name": row["given_name"] or "",
+        "family_name": row["family_name"] or "",
+        "phone_numbers": json.loads(row["phone_numbers"] or "[]"),
+        "email_addresses": json.loads(row["email_addresses"] or "[]"),
+        "postal_addresses": json.loads(row["postal_addresses"] or "[]"),
+        "organization": row["organization"] or "",
+        "job_title": row["job_title"] or "",
+        "notes": row["notes"] or "",
+        "source_device_id": row["source_device_id"] or "",
+    }
+    return payload
+
+
+def write_contact_history(cur: sqlite3.Cursor, row: sqlite3.Row, user_id: str, created_at: str) -> None:
+    snapshot = serialize_contact(row)
+    cur.execute(
+        """
+        INSERT INTO contact_history (history_id, user_id, contact_id, version, snapshot, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(uuid.uuid4()),
+            user_id,
+            row["contact_id"],
+            int(row["version"]),
+            json.dumps(snapshot, ensure_ascii=False),
+            created_at,
+        ),
+    )
+
+
+def insert_conflict(
+    cur: sqlite3.Cursor,
+    user_id: str,
+    local_id: str,
+    contact_id: Optional[str],
+    conflict_type: str,
+    local_payload: Dict[str, Any],
+    server_payload: Dict[str, Any],
+    created_at: str,
+) -> Dict[str, Any]:
+    conflict_id = str(uuid.uuid4())
+    cur.execute(
+        """
+        INSERT INTO conflict_log (
+            conflict_id, user_id, local_id, contact_id, conflict_type,
+            local_payload, server_payload, status, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)
+        """,
+        (
+            conflict_id,
+            user_id,
+            local_id,
+            contact_id,
+            conflict_type,
+            json.dumps(local_payload, ensure_ascii=False),
+            json.dumps(server_payload, ensure_ascii=False),
+            created_at,
+        ),
+    )
+    return {
+        "conflict_id": conflict_id,
+        "local_id": local_id,
+        "type": conflict_type,
+        "local": local_payload,
+        "server": server_payload,
+        "status": "open",
+        "created_at": created_at,
+    }
+
+
 def get_current_user_id(authorization: str = Header(default="")) -> str:
     if not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="missing bearer token")
@@ -290,7 +378,7 @@ def batch_upload(body: BatchUploadRequest, user_id: str = Depends(get_current_us
         for item in body.contacts:
             hash_value = contact_fingerprint(item)
             cur.execute(
-                "SELECT contact_id, hash, version FROM contacts WHERE user_id = ? AND local_id = ?",
+                "SELECT * FROM contacts WHERE user_id = ? AND local_id = ?",
                 (user_id, item.local_id),
             )
             existing = cur.fetchone()
@@ -334,6 +422,7 @@ def batch_upload(body: BatchUploadRequest, user_id: str = Depends(get_current_us
                 )
                 created += 1
             elif existing["hash"] != hash_value:
+                write_contact_history(cur, existing, user_id, now)
                 cur.execute(
                     """
                     UPDATE contacts
@@ -422,6 +511,7 @@ def sync_contacts(body: SyncRequest, user_id: str = Depends(get_current_user_id)
     try:
         cur = conn.cursor()
         for change in body.local_changes:
+            local_payload = change.model_dump()
             cur.execute(
                 "SELECT * FROM contacts WHERE user_id = ? AND local_id = ?",
                 (user_id, change.local_id),
@@ -437,13 +527,19 @@ def sync_contacts(body: SyncRequest, user_id: str = Depends(get_current_user_id)
                     continue
                 if is_server_newer:
                     conflicts.append(
-                        {
-                            "local_id": change.local_id,
-                            "type": "delete-modify",
-                            "server": serialize_contact(existing),
-                        }
+                        insert_conflict(
+                            cur=cur,
+                            user_id=user_id,
+                            local_id=change.local_id,
+                            contact_id=existing["contact_id"],
+                            conflict_type="delete-modify",
+                            local_payload=local_payload,
+                            server_payload=row_to_sync_change(existing),
+                            created_at=now,
+                        )
                     )
                     continue
+                write_contact_history(cur, existing, user_id, now)
                 cur.execute(
                     """
                     UPDATE contacts
@@ -495,11 +591,16 @@ def sync_contacts(body: SyncRequest, user_id: str = Depends(get_current_user_id)
             # If server has newer and changed content, defer to v0.3 conflict flow.
             if is_server_newer and existing["hash"] != hash_value and existing["deleted_at"] is None:
                 conflicts.append(
-                    {
-                        "local_id": change.local_id,
-                        "type": "value-conflict",
-                        "server": serialize_contact(existing),
-                    }
+                    insert_conflict(
+                        cur=cur,
+                        user_id=user_id,
+                        local_id=change.local_id,
+                        contact_id=existing["contact_id"],
+                        conflict_type="value-conflict",
+                        local_payload=local_payload,
+                        server_payload=row_to_sync_change(existing),
+                        created_at=now,
+                    )
                 )
                 continue
 
@@ -507,6 +608,7 @@ def sync_contacts(body: SyncRequest, user_id: str = Depends(get_current_user_id)
                 local_applied["skipped"] += 1
                 continue
 
+            write_contact_history(cur, existing, user_id, now)
             cur.execute(
                 """
                 UPDATE contacts
@@ -628,6 +730,278 @@ def sync_ack(body: SyncAckRequest, user_id: str = Depends(get_current_user_id)) 
     return {"status": "acknowledged", "acked_until": acked_until}
 
 
+@app.get("/api/v1/conflicts")
+def list_conflicts(
+    status: str = Query(default="open", pattern="^(open|resolved|all)$"),
+    user_id: str = Depends(get_current_user_id),
+) -> Dict[str, Any]:
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        if status == "all":
+            cur.execute(
+                "SELECT * FROM conflict_log WHERE user_id = ? ORDER BY created_at DESC",
+                (user_id,),
+            )
+        else:
+            cur.execute(
+                "SELECT * FROM conflict_log WHERE user_id = ? AND status = ? ORDER BY created_at DESC",
+                (user_id, status),
+            )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    items = []
+    for row in rows:
+        items.append(
+            {
+                "conflict_id": row["conflict_id"],
+                "local_id": row["local_id"],
+                "contact_id": row["contact_id"],
+                "type": row["conflict_type"],
+                "local": json.loads(row["local_payload"]),
+                "server": json.loads(row["server_payload"]),
+                "status": row["status"],
+                "created_at": row["created_at"],
+                "resolved_at": row["resolved_at"],
+            }
+        )
+    return {"count": len(items), "items": items}
+
+
+@app.post("/api/v1/conflicts/{conflict_id}/resolve")
+def resolve_conflict(
+    conflict_id: str,
+    body: ResolveConflictRequest,
+    user_id: str = Depends(get_current_user_id),
+) -> Dict[str, Any]:
+    resolved_at = now_iso()
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM conflict_log WHERE conflict_id = ? AND user_id = ? AND status = 'open'",
+            (conflict_id, user_id),
+        )
+        conflict = cur.fetchone()
+        if conflict is None:
+            raise HTTPException(status_code=404, detail="open conflict not found")
+
+        local_payload = json.loads(conflict["local_payload"])
+        server_payload = json.loads(conflict["server_payload"])
+        contact_id = conflict["contact_id"]
+        local_id = conflict["local_id"]
+
+        if contact_id:
+            cur.execute(
+                "SELECT * FROM contacts WHERE contact_id = ? AND user_id = ?",
+                (contact_id, user_id),
+            )
+            existing = cur.fetchone()
+        else:
+            existing = None
+
+        if body.strategy == "keep_local":
+            final_payload = local_payload
+        elif body.strategy == "keep_server":
+            final_payload = server_payload
+        else:
+            if body.merged_contact is None:
+                raise HTTPException(status_code=400, detail="merged_contact required for manual_merge")
+            final_payload = body.merged_contact.model_dump()
+
+        op = final_payload.get("op", "upsert")
+        if op == "delete":
+            if existing is not None:
+                write_contact_history(cur, existing, user_id, resolved_at)
+                cur.execute(
+                    """
+                    UPDATE contacts
+                    SET deleted_at = ?, updated_at = ?, source_device_id = ?, sync_status = ?
+                    WHERE contact_id = ?
+                    """,
+                    (resolved_at, resolved_at, body.device_id, "synced", existing["contact_id"]),
+                )
+        else:
+            change = SyncChange(**final_payload)
+            hash_value = sync_change_fingerprint(change)
+            if existing is None:
+                cur.execute(
+                    """
+                    INSERT INTO contacts (
+                        contact_id, user_id, display_name, given_name, family_name,
+                        phone_numbers, email_addresses, postal_addresses,
+                        organization, job_title, notes, photo_uri, source_device_id,
+                        local_id, version, sync_status, hash, created_at, updated_at, deleted_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        user_id,
+                        change.display_name,
+                        change.given_name,
+                        change.family_name,
+                        json.dumps(change.phone_numbers, ensure_ascii=False),
+                        json.dumps(change.email_addresses, ensure_ascii=False),
+                        json.dumps(change.postal_addresses, ensure_ascii=False),
+                        change.organization,
+                        change.job_title,
+                        change.notes,
+                        "",
+                        change.source_device_id or body.device_id,
+                        local_id,
+                        1,
+                        "synced",
+                        hash_value,
+                        resolved_at,
+                        resolved_at,
+                    ),
+                )
+            else:
+                write_contact_history(cur, existing, user_id, resolved_at)
+                cur.execute(
+                    """
+                    UPDATE contacts
+                    SET display_name = ?, given_name = ?, family_name = ?,
+                        phone_numbers = ?, email_addresses = ?, postal_addresses = ?,
+                        organization = ?, job_title = ?, notes = ?, source_device_id = ?,
+                        version = ?, sync_status = ?, hash = ?, updated_at = ?, deleted_at = NULL
+                    WHERE contact_id = ?
+                    """,
+                    (
+                        change.display_name,
+                        change.given_name,
+                        change.family_name,
+                        json.dumps(change.phone_numbers, ensure_ascii=False),
+                        json.dumps(change.email_addresses, ensure_ascii=False),
+                        json.dumps(change.postal_addresses, ensure_ascii=False),
+                        change.organization,
+                        change.job_title,
+                        change.notes,
+                        change.source_device_id or body.device_id,
+                        int(existing["version"]) + 1,
+                        "synced",
+                        hash_value,
+                        resolved_at,
+                        existing["contact_id"],
+                    ),
+                )
+
+        cur.execute(
+            """
+            UPDATE conflict_log
+            SET status = 'resolved', resolved_payload = ?, resolved_at = ?
+            WHERE conflict_id = ?
+            """,
+            (json.dumps(final_payload, ensure_ascii=False), resolved_at, conflict_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {"status": "resolved", "conflict_id": conflict_id, "resolved_at": resolved_at}
+
+
+@app.get("/api/v1/contacts/{contact_id}/history")
+def contact_history(contact_id: str, user_id: str = Depends(get_current_user_id)) -> Dict[str, Any]:
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT history_id, version, snapshot, created_at
+            FROM contact_history
+            WHERE user_id = ? AND contact_id = ?
+            ORDER BY created_at DESC
+            """,
+            (user_id, contact_id),
+        )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    items = []
+    for row in rows:
+        items.append(
+            {
+                "history_id": row["history_id"],
+                "version": row["version"],
+                "snapshot": json.loads(row["snapshot"]),
+                "created_at": row["created_at"],
+            }
+        )
+    return {"count": len(items), "items": items}
+
+
+@app.post("/api/v1/contacts/{contact_id}/rollback")
+def rollback_contact(
+    contact_id: str,
+    body: RollbackRequest,
+    user_id: str = Depends(get_current_user_id),
+) -> Dict[str, Any]:
+    now = now_iso()
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM contacts WHERE user_id = ? AND contact_id = ?",
+            (user_id, contact_id),
+        )
+        existing = cur.fetchone()
+        if existing is None:
+            raise HTTPException(status_code=404, detail="contact not found")
+
+        cur.execute(
+            """
+            SELECT snapshot
+            FROM contact_history
+            WHERE history_id = ? AND user_id = ? AND contact_id = ?
+            """,
+            (body.history_id, user_id, contact_id),
+        )
+        history = cur.fetchone()
+        if history is None:
+            raise HTTPException(status_code=404, detail="history not found")
+
+        snapshot = json.loads(history["snapshot"])
+        write_contact_history(cur, existing, user_id, now)
+        cur.execute(
+            """
+            UPDATE contacts
+            SET display_name = ?, given_name = ?, family_name = ?,
+                phone_numbers = ?, email_addresses = ?, postal_addresses = ?,
+                organization = ?, job_title = ?, notes = ?, photo_uri = ?,
+                source_device_id = ?, version = ?, sync_status = ?, hash = ?,
+                updated_at = ?, deleted_at = ?
+            WHERE contact_id = ?
+            """,
+            (
+                snapshot.get("display_name", ""),
+                snapshot.get("given_name", ""),
+                snapshot.get("family_name", ""),
+                json.dumps(snapshot.get("phone_numbers", []), ensure_ascii=False),
+                json.dumps(snapshot.get("email_addresses", []), ensure_ascii=False),
+                json.dumps(snapshot.get("postal_addresses", []), ensure_ascii=False),
+                snapshot.get("organization", ""),
+                snapshot.get("job_title", ""),
+                snapshot.get("notes", ""),
+                snapshot.get("photo_uri", ""),
+                body.device_id,
+                int(existing["version"]) + 1,
+                "synced",
+                snapshot.get("hash", existing["hash"]),
+                now,
+                snapshot.get("deleted_at"),
+                contact_id,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "rolled_back", "contact_id": contact_id, "history_id": body.history_id}
+
+
 @app.post("/api/v1/contacts/{contact_id}/photo")
 async def upload_photo(
     contact_id: str,
@@ -638,7 +1012,7 @@ async def upload_photo(
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT contact_id FROM contacts WHERE user_id = ? AND contact_id = ? AND deleted_at IS NULL",
+            "SELECT * FROM contacts WHERE user_id = ? AND contact_id = ? AND deleted_at IS NULL",
             (user_id, contact_id),
         )
         row = cur.fetchone()
@@ -670,6 +1044,7 @@ async def upload_photo(
         file_path.write_bytes(out.getvalue())
         uri = f"/storage/photos/{file_name}"
 
+        write_contact_history(cur, row, user_id, now_iso())
         cur.execute(
             "UPDATE contacts SET photo_uri = ?, updated_at = ? WHERE contact_id = ?",
             (uri, now_iso(), contact_id),
