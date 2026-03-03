@@ -1,4 +1,4 @@
-# CloudSyncContacts v0.1
+# CloudSyncContacts v1.0
 
 基于规格书 `v0.1 + v0.2 + v0.3 + v0.4 + v1.0` 的可运行后端实现。
 
@@ -32,6 +32,14 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
+## Docker Compose
+```bash
+docker compose up --build
+```
+
+- API: `http://127.0.0.1:8000`
+- 说明：当前应用数据层仍使用 SQLite（便于快速验证）；`postgres/redis` 服务已加入编排，便于后续迁移。
+
 ## 快速验证
 ```bash
 # 1) 注册
@@ -54,6 +62,18 @@ curl -sS -X POST http://127.0.0.1:8000/api/v1/contacts/batch \
 curl -sS "http://127.0.0.1:8000/api/v1/contacts?page=1&page_size=20" \
   -H "Authorization: Bearer $TOKEN"
 ```
+
+## 性能基线
+服务启动后执行：
+
+```bash
+python3 scripts/perf_test.py --base-url http://127.0.0.1:8000 --contacts 5000 --sync-changes 1000 --workers 8
+```
+
+输出包括：
+- 全量上传总耗时与吞吐（contacts/s）
+- 增量同步总耗时与吞吐（changes/s）
+- 请求延迟 `avg/p50/p95/p99`
 
 ## 注意
 - 当前为 v1.0 后端可验证版本，未包含 iOS/Android 客户端实现。
