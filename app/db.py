@@ -103,12 +103,39 @@ def init_db() -> None:
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS refresh_tokens (
+                token_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                expires_at TEXT NOT NULL,
+                revoked INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audit_log (
+                audit_id TEXT PRIMARY KEY,
+                user_id TEXT,
+                action TEXT NOT NULL,
+                target_type TEXT,
+                target_id TEXT,
+                metadata TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_contacts_user_updated ON contacts(user_id, updated_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_contacts_user_deleted ON contacts(user_id, deleted_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_sync_ack_user_device ON sync_ack_log(user_id, device_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_conflict_user_status ON conflict_log(user_id, status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_history_contact_version ON contact_history(contact_id, version)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_dedupe_ignore_user_pair ON dedupe_ignore(user_id, pair_key)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_user_revoked ON refresh_tokens(user_id, revoked)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_user_time ON audit_log(user_id, created_at)")
         conn.commit()
     finally:
         conn.close()

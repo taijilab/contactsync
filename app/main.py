@@ -8,13 +8,16 @@ import os
 import re
 import secrets
 import sqlite3
+import time
 import uuid
+from collections import defaultdict
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field, model_validator
 from PIL import Image
 
@@ -22,6 +25,7 @@ from app.db import get_conn, init_db
 
 APP_SECRET = os.getenv("APP_SECRET", "dev-secret-change-me")
 TOKEN_TTL_SECONDS = int(os.getenv("TOKEN_TTL_SECONDS", "86400"))
+REFRESH_TOKEN_TTL_SECONDS = int(os.getenv("REFRESH_TOKEN_TTL_SECONDS", str(30 * 24 * 3600)))
 PHOTO_DIR = Path(__file__).resolve().parent.parent / "storage" / "photos"
 PHOTO_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -111,15 +115,38 @@ class DedupeIgnoreRequest(BaseModel):
 
 class TokenResponse(BaseModel):
     access_token: str
+    refresh_token: Optional[str] = None
     token_type: str = "Bearer"
 
 
-app = FastAPI(title="CloudSyncContacts v0.4", version="0.4.0")
+class RefreshRequest(BaseModel):
+    refresh_token: str = Field(min_length=16)
+
+
+app = FastAPI(title="CloudSyncContacts v1.0", version="1.0.0")
 init_db()
+METRICS: Dict[str, Dict[str, float]] = defaultdict(lambda: {"count": 0.0, "error_count": 0.0, "total_ms": 0.0})
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+@app.middleware("http")
+async def metrics_middleware(request: Request, call_next):
+    start = time.perf_counter()
+    key = f"{request.method} {request.url.path}"
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        METRICS[key]["count"] += 1.0
+        METRICS[key]["total_ms"] += elapsed_ms
+        if status_code >= 400:
+            METRICS[key]["error_count"] += 1.0
 
 
 def parse_iso_or_400(value: str, field_name: str) -> datetime:
@@ -142,12 +169,14 @@ def _b64url_decode(value: str) -> bytes:
     return base64.urlsafe_b64decode((value + padding).encode("utf-8"))
 
 
-def create_token(user_id: str) -> str:
+def create_token(user_id: str, token_type: str = "access", ttl_seconds: Optional[int] = None) -> str:
+    ttl = ttl_seconds if ttl_seconds is not None else TOKEN_TTL_SECONDS
     header = {"alg": "HS256", "typ": "JWT"}
     payload = {
         "sub": user_id,
+        "typ": token_type,
         "iat": int(datetime.now(timezone.utc).timestamp()),
-        "exp": int(datetime.now(timezone.utc).timestamp()) + TOKEN_TTL_SECONDS,
+        "exp": int(datetime.now(timezone.utc).timestamp()) + ttl,
         "jti": secrets.token_hex(8),
     }
     header_b64 = _b64url(json.dumps(header, separators=(",", ":")).encode("utf-8"))
@@ -173,6 +202,31 @@ def verify_token(token: str) -> Dict[str, Any]:
     if int(payload.get("exp", 0)) < int(datetime.now(timezone.utc).timestamp()):
         raise HTTPException(status_code=401, detail="token expired")
     return payload
+
+
+def token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def issue_refresh_token(cur: sqlite3.Cursor, user_id: str, created_at: str) -> str:
+    refresh_token = create_token(user_id, token_type="refresh", ttl_seconds=REFRESH_TOKEN_TTL_SECONDS)
+    cur.execute(
+        """
+        INSERT INTO refresh_tokens (token_id, user_id, token_hash, expires_at, revoked, created_at)
+        VALUES (?, ?, ?, ?, 0, ?)
+        """,
+        (
+            str(uuid.uuid4()),
+            user_id,
+            token_digest(refresh_token),
+            datetime.fromtimestamp(
+                verify_token(refresh_token)["exp"],
+                tz=timezone.utc,
+            ).isoformat(),
+            created_at,
+        ),
+    )
+    return refresh_token
 
 
 def password_hash(password: str, salt: Optional[str] = None) -> str:
@@ -436,7 +490,34 @@ def get_current_user_id(authorization: str = Header(default="")) -> str:
         raise HTTPException(status_code=401, detail="missing bearer token")
     token = authorization.split(" ", 1)[1].strip()
     payload = verify_token(token)
+    if payload.get("typ") not in (None, "access"):
+        raise HTTPException(status_code=401, detail="invalid token type")
     return payload["sub"]
+
+
+def write_audit(
+    cur: sqlite3.Cursor,
+    action: str,
+    user_id: Optional[str] = None,
+    target_type: Optional[str] = None,
+    target_id: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    cur.execute(
+        """
+        INSERT INTO audit_log (audit_id, user_id, action, target_type, target_id, metadata, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(uuid.uuid4()),
+            user_id,
+            action,
+            target_type,
+            target_id,
+            json.dumps(metadata or {}, ensure_ascii=False),
+            now_iso(),
+        ),
+    )
 
 
 @app.get("/health")
@@ -457,13 +538,15 @@ def register(body: RegisterRequest) -> TokenResponse:
             "INSERT INTO users (user_id, email, phone, password_hash, created_at) VALUES (?, ?, ?, ?, ?)",
             (user_id, body.email, body.phone, hashed, created_at),
         )
+        refresh_token = issue_refresh_token(cur, user_id, created_at)
+        write_audit(cur, "auth.register", user_id=user_id, target_type="user", target_id=user_id)
         conn.commit()
     except sqlite3.IntegrityError as exc:
         raise HTTPException(status_code=409, detail="user already exists") from exc
     finally:
         conn.close()
 
-    return TokenResponse(access_token=create_token(user_id))
+    return TokenResponse(access_token=create_token(user_id, token_type="access"), refresh_token=refresh_token)
 
 
 @app.post("/api/v1/auth/login", response_model=TokenResponse)
@@ -484,8 +567,48 @@ def login(body: LoginRequest) -> TokenResponse:
 
     if row is None or not verify_password(body.password, row["password_hash"]):
         raise HTTPException(status_code=401, detail="invalid credentials")
+    user_id = row["user_id"]
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE refresh_tokens SET revoked = 1 WHERE user_id = ? AND revoked = 0", (user_id,))
+        refresh_token = issue_refresh_token(cur, user_id, now_iso())
+        write_audit(cur, "auth.login", user_id=user_id, target_type="user", target_id=user_id)
+        conn.commit()
+    finally:
+        conn.close()
 
-    return TokenResponse(access_token=create_token(row["user_id"]))
+    return TokenResponse(access_token=create_token(user_id, token_type="access"), refresh_token=refresh_token)
+
+
+@app.post("/api/v1/auth/refresh", response_model=TokenResponse)
+def refresh_access_token(body: RefreshRequest) -> TokenResponse:
+    payload = verify_token(body.refresh_token)
+    if payload.get("typ") != "refresh":
+        raise HTTPException(status_code=401, detail="invalid refresh token")
+    user_id = payload["sub"]
+    digest = token_digest(body.refresh_token)
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM refresh_tokens WHERE user_id = ? AND token_hash = ? AND revoked = 0",
+            (user_id, digest),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise HTTPException(status_code=401, detail="refresh token revoked or not found")
+        if parse_iso_or_400(row["expires_at"], "expires_at") < datetime.now(timezone.utc):
+            raise HTTPException(status_code=401, detail="refresh token expired")
+
+        cur.execute("UPDATE refresh_tokens SET revoked = 1 WHERE token_id = ?", (row["token_id"],))
+        new_refresh_token = issue_refresh_token(cur, user_id, now_iso())
+        write_audit(cur, "auth.refresh", user_id=user_id, target_type="user", target_id=user_id)
+        conn.commit()
+    finally:
+        conn.close()
+
+    return TokenResponse(access_token=create_token(user_id, token_type="access"), refresh_token=new_refresh_token)
 
 
 @app.post("/api/v1/contacts/batch")
@@ -575,6 +698,13 @@ def batch_upload(body: BatchUploadRequest, user_id: str = Depends(get_current_us
                 )
                 updated += 1
 
+        write_audit(
+            cur,
+            "contacts.batch_upload",
+            user_id=user_id,
+            target_type="contact",
+            metadata={"created": created, "updated": updated, "total": len(body.contacts)},
+        )
         conn.commit()
     finally:
         conn.close()
@@ -846,6 +976,14 @@ def sync_ack(body: SyncAckRequest, user_id: str = Depends(get_current_user_id)) 
             "INSERT INTO sync_ack_log (ack_id, user_id, device_id, acked_until, created_at) VALUES (?, ?, ?, ?, ?)",
             (str(uuid.uuid4()), user_id, body.device_id, acked_until, created_at),
         )
+        write_audit(
+            cur,
+            "sync.ack",
+            user_id=user_id,
+            target_type="device",
+            target_id=body.device_id,
+            metadata={"acked_until": acked_until},
+        )
         conn.commit()
     finally:
         conn.close()
@@ -1018,6 +1156,14 @@ def resolve_conflict(
             """,
             (json.dumps(final_payload, ensure_ascii=False), resolved_at, conflict_id),
         )
+        write_audit(
+            cur,
+            "conflict.resolve",
+            user_id=user_id,
+            target_type="conflict",
+            target_id=conflict_id,
+            metadata={"strategy": body.strategy},
+        )
         conn.commit()
     finally:
         conn.close()
@@ -1118,6 +1264,14 @@ def rollback_contact(
                 contact_id,
             ),
         )
+        write_audit(
+            cur,
+            "contact.rollback",
+            user_id=user_id,
+            target_type="contact",
+            target_id=contact_id,
+            metadata={"history_id": body.history_id},
+        )
         conn.commit()
     finally:
         conn.close()
@@ -1184,6 +1338,13 @@ def dedupe_ignore(body: DedupeIgnoreRequest, user_id: str = Depends(get_current_
             VALUES (?, ?, ?, ?)
             """,
             (str(uuid.uuid4()), user_id, key, created_at),
+        )
+        write_audit(
+            cur,
+            "dedupe.ignore",
+            user_id=user_id,
+            target_type="dedupe_pair",
+            target_id=key,
         )
         conn.commit()
     finally:
@@ -1295,6 +1456,14 @@ def dedupe_merge(body: DedupeMergeRequest, user_id: str = Depends(get_current_us
             )
             deleted_count += 1
 
+        write_audit(
+            cur,
+            "dedupe.merge",
+            user_id=user_id,
+            target_type="contact",
+            target_id=primary_local_id,
+            metadata={"merged_count": deleted_count + 1},
+        )
         conn.commit()
     finally:
         conn.close()
@@ -1305,6 +1474,108 @@ def dedupe_merge(body: DedupeMergeRequest, user_id: str = Depends(get_current_us
         "merged_count": deleted_count + 1,
         "deleted_count": deleted_count,
     }
+
+
+def vcard_escape(value: str) -> str:
+    text = (value or "").replace("\\", "\\\\").replace("\n", "\\n")
+    return re.sub(r"[;,]", lambda m: "\\" + m.group(0), text)
+
+
+@app.get("/api/v1/contacts/export.vcf", response_class=PlainTextResponse)
+def export_contacts_vcf(user_id: str = Depends(get_current_user_id)) -> PlainTextResponse:
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM contacts WHERE user_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC",
+            (user_id,),
+        )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    cards = []
+    for row in rows:
+        phones = json.loads(row["phone_numbers"] or "[]")
+        emails = json.loads(row["email_addresses"] or "[]")
+        lines = [
+            "BEGIN:VCARD",
+            "VERSION:3.0",
+            "FN:" + vcard_escape(row["display_name"] or ""),
+            "N:{};{};;;".format(vcard_escape(row["family_name"] or ""), vcard_escape(row["given_name"] or "")),
+        ]
+        for p in phones:
+            ptype = (p.get("type") or "CELL").upper()
+            lines.append("TEL;TYPE={}:{}".format(vcard_escape(ptype), vcard_escape(str(p.get("value", "")))))
+        for e in emails:
+            etype = (e.get("type") or "INTERNET").upper()
+            lines.append("EMAIL;TYPE={}:{}".format(vcard_escape(etype), vcard_escape(str(e.get("value", "")))))
+        if row["organization"]:
+            lines.append("ORG:" + vcard_escape(row["organization"]))
+        if row["job_title"]:
+            lines.append("TITLE:" + vcard_escape(row["job_title"]))
+        if row["notes"]:
+            lines.append("NOTE:" + vcard_escape(row["notes"]))
+        lines.append("END:VCARD")
+        cards.append("\r\n".join(lines))
+
+    content = "\r\n".join(cards) + ("\r\n" if cards else "")
+    return PlainTextResponse(
+        content=content,
+        headers={"Content-Disposition": 'attachment; filename="contactsync-export.vcf"'},
+    )
+
+
+@app.get("/api/v1/metrics")
+def app_metrics() -> Dict[str, Any]:
+    items = []
+    total_requests = 0
+    total_errors = 0
+    for key, value in METRICS.items():
+        count = int(value["count"])
+        errors = int(value["error_count"])
+        avg_ms = (value["total_ms"] / value["count"]) if value["count"] else 0.0
+        items.append({"endpoint": key, "count": count, "error_count": errors, "avg_latency_ms": round(avg_ms, 2)})
+        total_requests += count
+        total_errors += errors
+    items.sort(key=lambda x: x["endpoint"])
+    return {"total_requests": total_requests, "total_errors": total_errors, "items": items}
+
+
+@app.get("/api/v1/audit")
+def list_audit_logs(
+    limit: int = Query(default=50, ge=1, le=200),
+    user_id: str = Depends(get_current_user_id),
+) -> Dict[str, Any]:
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT audit_id, action, target_type, target_id, metadata, created_at
+            FROM audit_log
+            WHERE user_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+    items = []
+    for row in rows:
+        items.append(
+            {
+                "audit_id": row["audit_id"],
+                "action": row["action"],
+                "target_type": row["target_type"],
+                "target_id": row["target_id"],
+                "metadata": json.loads(row["metadata"] or "{}"),
+                "created_at": row["created_at"],
+            }
+        )
+    return {"count": len(items), "items": items}
 
 
 @app.post("/api/v1/contacts/{contact_id}/photo")
