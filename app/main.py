@@ -1,8 +1,11 @@
 import base64
+import difflib
 import hashlib
 import hmac
+import itertools
 import json
 import os
+import re
 import secrets
 import sqlite3
 import uuid
@@ -96,12 +99,22 @@ class RollbackRequest(BaseModel):
     device_id: str = Field(min_length=1, max_length=128)
 
 
+class DedupeMergeRequest(BaseModel):
+    local_ids: List[str] = Field(min_items=2, max_items=20)
+    device_id: str = Field(min_length=1, max_length=128)
+
+
+class DedupeIgnoreRequest(BaseModel):
+    local_id_a: str = Field(min_length=1, max_length=128)
+    local_id_b: str = Field(min_length=1, max_length=128)
+
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "Bearer"
 
 
-app = FastAPI(title="CloudSyncContacts v0.3", version="0.3.0")
+app = FastAPI(title="CloudSyncContacts v0.4", version="0.4.0")
 init_db()
 
 
@@ -307,6 +320,115 @@ def insert_conflict(
         "status": "open",
         "created_at": created_at,
     }
+
+
+def normalize_phone(value: str) -> str:
+    digits = "".join(ch for ch in value if ch.isdigit())
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if digits.startswith("86") and len(digits) > 11:
+        digits = digits[2:]
+    if digits.startswith("0") and len(digits) > 10:
+        digits = digits[1:]
+    return digits
+
+
+def phone_set(contact: Dict[str, Any]) -> set:
+    values = set()
+    for item in contact.get("phone_numbers", []):
+        raw = str(item.get("value", ""))
+        norm = normalize_phone(raw)
+        if norm:
+            values.add(norm)
+    return values
+
+
+def email_set(contact: Dict[str, Any]) -> set:
+    values = set()
+    for item in contact.get("email_addresses", []):
+        raw = str(item.get("value", "")).strip().lower()
+        if raw:
+            values.add(raw)
+    return values
+
+
+def name_similarity(a: str, b: str) -> int:
+    if not a or not b:
+        return 0
+    ratio = difflib.SequenceMatcher(None, a.lower().strip(), b.lower().strip()).ratio()
+    return int(ratio * 100)
+
+
+def auxiliary_score(a: Dict[str, Any], b: Dict[str, Any]) -> int:
+    org_a = (a.get("organization") or "").strip().lower()
+    org_b = (b.get("organization") or "").strip().lower()
+    if not org_a or not org_b or org_a != org_b:
+        return 0
+    job_sim = name_similarity(a.get("job_title", ""), b.get("job_title", ""))
+    return 70 if job_sim < 50 else 100
+
+
+def dedupe_score(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    phone_score = 100 if phone_set(a) & phone_set(b) else 0
+    email_score = 100 if email_set(a) & email_set(b) else 0
+    name_score = name_similarity(a.get("display_name", ""), b.get("display_name", ""))
+    if name_score < 85:
+        name_score = 0
+    aux_score = auxiliary_score(a, b)
+    total = int(0.4 * phone_score + 0.3 * email_score + 0.2 * name_score + 0.1 * aux_score)
+    # Align with spec acceptance: same normalized phone should be flagged as suspected duplicate.
+    if phone_score == 100 and total < 75:
+        total = 75
+    return {
+        "total": total,
+        "phone_score": phone_score,
+        "email_score": email_score,
+        "name_score": name_score,
+        "aux_score": aux_score,
+    }
+
+
+def pair_key(a: str, b: str) -> str:
+    x, y = sorted([a, b])
+    return f"{x}|{y}"
+
+
+def more_complete_name(a: str, b: str) -> str:
+    return a if len((a or "").strip()) >= len((b or "").strip()) else b
+
+
+def union_unique_dicts(left: List[Dict[str, Any]], right: List[Dict[str, Any]], key_field: str) -> List[Dict[str, Any]]:
+    seen = set()
+    out: List[Dict[str, Any]] = []
+    for item in left + right:
+        key = str(item.get(key_field, "")).strip().lower()
+        if not key:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def merge_two_contacts(primary: Dict[str, Any], secondary: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(primary)
+    merged["display_name"] = more_complete_name(primary.get("display_name", ""), secondary.get("display_name", ""))
+    merged["given_name"] = more_complete_name(primary.get("given_name", ""), secondary.get("given_name", ""))
+    merged["family_name"] = more_complete_name(primary.get("family_name", ""), secondary.get("family_name", ""))
+    merged["phone_numbers"] = union_unique_dicts(primary.get("phone_numbers", []), secondary.get("phone_numbers", []), "value")
+    merged["email_addresses"] = union_unique_dicts(primary.get("email_addresses", []), secondary.get("email_addresses", []), "value")
+    merged["postal_addresses"] = union_unique_dicts(primary.get("postal_addresses", []), secondary.get("postal_addresses", []), "value")
+    merged["organization"] = primary.get("organization") or secondary.get("organization") or ""
+    merged["job_title"] = primary.get("job_title") or secondary.get("job_title") or ""
+    p_notes = (primary.get("notes") or "").strip()
+    s_notes = (secondary.get("notes") or "").strip()
+    if p_notes and s_notes and p_notes != s_notes:
+        merged["notes"] = f"{p_notes}\\n---\\n{s_notes}"
+    else:
+        merged["notes"] = p_notes or s_notes
+    merged["photo_uri"] = primary.get("photo_uri") or secondary.get("photo_uri") or ""
+    return merged
 
 
 def get_current_user_id(authorization: str = Header(default="")) -> str:
@@ -1000,6 +1122,189 @@ def rollback_contact(
     finally:
         conn.close()
     return {"status": "rolled_back", "contact_id": contact_id, "history_id": body.history_id}
+
+
+@app.get("/api/v1/dedupe/candidates")
+def dedupe_candidates(
+    min_score: int = Query(default=75, ge=1, le=100),
+    user_id: str = Depends(get_current_user_id),
+) -> Dict[str, Any]:
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT *
+            FROM contacts
+            WHERE user_id = ? AND deleted_at IS NULL
+            ORDER BY updated_at DESC
+            """,
+            (user_id,),
+        )
+        rows = cur.fetchall()
+        cur.execute("SELECT pair_key FROM dedupe_ignore WHERE user_id = ?", (user_id,))
+        ignored = {row["pair_key"] for row in cur.fetchall()}
+    finally:
+        conn.close()
+
+    contacts = [serialize_contact(row) for row in rows]
+    candidates = []
+    for left, right in itertools.combinations(contacts, 2):
+        key = pair_key(left["local_id"], right["local_id"])
+        if key in ignored:
+            continue
+        score = dedupe_score(left, right)
+        if score["total"] < min_score:
+            continue
+        confidence = "high" if score["total"] >= 90 else "suspected"
+        candidates.append(
+            {
+                "pair_key": key,
+                "confidence": confidence,
+                "score": score,
+                "left": left,
+                "right": right,
+            }
+        )
+
+    candidates.sort(key=lambda x: x["score"]["total"], reverse=True)
+    return {"count": len(candidates), "items": candidates}
+
+
+@app.post("/api/v1/dedupe/ignore")
+def dedupe_ignore(body: DedupeIgnoreRequest, user_id: str = Depends(get_current_user_id)) -> Dict[str, str]:
+    key = pair_key(body.local_id_a, body.local_id_b)
+    created_at = now_iso()
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO dedupe_ignore (ignore_id, user_id, pair_key, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (str(uuid.uuid4()), user_id, key, created_at),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "ignored", "pair_key": key}
+
+
+@app.post("/api/v1/dedupe/merge")
+def dedupe_merge(body: DedupeMergeRequest, user_id: str = Depends(get_current_user_id)) -> Dict[str, Any]:
+    unique_ids = list(dict.fromkeys(body.local_ids))
+    now = now_iso()
+    if len(unique_ids) < 2:
+        raise HTTPException(status_code=400, detail="need at least 2 unique local_ids")
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        q_marks = ",".join(["?"] * len(unique_ids))
+        cur.execute(
+            f"SELECT * FROM contacts WHERE user_id = ? AND deleted_at IS NULL AND local_id IN ({q_marks})",
+            [user_id] + unique_ids,
+        )
+        rows = cur.fetchall()
+        if len(rows) != len(unique_ids):
+            raise HTTPException(status_code=404, detail="some contacts not found")
+
+        contacts = [serialize_contact(row) for row in rows]
+        by_local_id = {c["local_id"]: c for c in contacts}
+        rows_by_local_id = {row["local_id"]: row for row in rows}
+
+        # pick primary as the one with the most complete name+fields
+        def completeness(c: Dict[str, Any]) -> int:
+            return (
+                len(c.get("display_name", "") or "")
+                + len(c.get("given_name", "") or "")
+                + len(c.get("family_name", "") or "")
+                + 5 * len(c.get("phone_numbers", []))
+                + 3 * len(c.get("email_addresses", []))
+            )
+
+        primary_local_id = sorted(unique_ids, key=lambda x: completeness(by_local_id[x]), reverse=True)[0]
+        merged = dict(by_local_id[primary_local_id])
+        for local_id in unique_ids:
+            if local_id == primary_local_id:
+                continue
+            merged = merge_two_contacts(merged, by_local_id[local_id])
+
+        # Persist merge: update primary, soft-delete others.
+        primary_row = rows_by_local_id[primary_local_id]
+        write_contact_history(cur, primary_row, user_id, now)
+        merged_change = SyncChange(
+            op="upsert",
+            local_id=primary_local_id,
+            display_name=merged.get("display_name", ""),
+            given_name=merged.get("given_name", ""),
+            family_name=merged.get("family_name", ""),
+            phone_numbers=merged.get("phone_numbers", []),
+            email_addresses=merged.get("email_addresses", []),
+            postal_addresses=merged.get("postal_addresses", []),
+            organization=merged.get("organization", ""),
+            job_title=merged.get("job_title", ""),
+            notes=merged.get("notes", ""),
+            source_device_id=body.device_id,
+        )
+        merged_hash = sync_change_fingerprint(merged_change)
+        cur.execute(
+            """
+            UPDATE contacts
+            SET display_name = ?, given_name = ?, family_name = ?,
+                phone_numbers = ?, email_addresses = ?, postal_addresses = ?,
+                organization = ?, job_title = ?, notes = ?, photo_uri = ?,
+                source_device_id = ?, version = ?, sync_status = ?, hash = ?,
+                updated_at = ?, deleted_at = NULL
+            WHERE contact_id = ?
+            """,
+            (
+                merged_change.display_name,
+                merged_change.given_name,
+                merged_change.family_name,
+                json.dumps(merged_change.phone_numbers, ensure_ascii=False),
+                json.dumps(merged_change.email_addresses, ensure_ascii=False),
+                json.dumps(merged_change.postal_addresses, ensure_ascii=False),
+                merged_change.organization,
+                merged_change.job_title,
+                merged_change.notes,
+                merged.get("photo_uri", ""),
+                body.device_id,
+                int(primary_row["version"]) + 1,
+                "synced",
+                merged_hash,
+                now,
+                primary_row["contact_id"],
+            ),
+        )
+
+        deleted_count = 0
+        for local_id in unique_ids:
+            if local_id == primary_local_id:
+                continue
+            row = rows_by_local_id[local_id]
+            write_contact_history(cur, row, user_id, now)
+            cur.execute(
+                """
+                UPDATE contacts
+                SET deleted_at = ?, updated_at = ?, source_device_id = ?, sync_status = ?
+                WHERE contact_id = ?
+                """,
+                (now, now, body.device_id, "synced", row["contact_id"]),
+            )
+            deleted_count += 1
+
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "status": "merged",
+        "primary_local_id": primary_local_id,
+        "merged_count": deleted_count + 1,
+        "deleted_count": deleted_count,
+    }
 
 
 @app.post("/api/v1/contacts/{contact_id}/photo")

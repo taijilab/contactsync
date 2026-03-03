@@ -92,11 +92,23 @@ def init_db() -> None:
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dedupe_ignore (
+                ignore_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                pair_key TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(user_id, pair_key)
+            )
+            """
+        )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_contacts_user_updated ON contacts(user_id, updated_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_contacts_user_deleted ON contacts(user_id, deleted_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_sync_ack_user_device ON sync_ack_log(user_id, device_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_conflict_user_status ON conflict_log(user_id, status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_history_contact_version ON contact_history(contact_id, version)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_dedupe_ignore_user_pair ON dedupe_ignore(user_id, pair_key)")
         conn.commit()
     finally:
         conn.close()
