@@ -59,17 +59,54 @@ class BatchUploadRequest(BaseModel):
     contacts: List[ContactIn] = Field(min_items=1, max_items=500)
 
 
+class SyncChange(BaseModel):
+    op: str = Field(pattern="^(upsert|delete)$")
+    local_id: str = Field(min_length=1, max_length=128)
+    display_name: str = ""
+    given_name: str = ""
+    family_name: str = ""
+    phone_numbers: List[Dict[str, Any]] = Field(default_factory=list)
+    email_addresses: List[Dict[str, Any]] = Field(default_factory=list)
+    postal_addresses: List[Dict[str, Any]] = Field(default_factory=list)
+    organization: str = ""
+    job_title: str = ""
+    notes: str = ""
+    source_device_id: str = ""
+
+
+class SyncRequest(BaseModel):
+    last_sync_time: str
+    local_changes: List[SyncChange] = Field(default_factory=list, max_items=1000)
+    device_id: str = Field(min_length=1, max_length=128)
+
+
+class SyncAckRequest(BaseModel):
+    device_id: str = Field(min_length=1, max_length=128)
+    acked_until: str
+
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "Bearer"
 
 
-app = FastAPI(title="CloudSyncContacts v0.1", version="0.1.0")
+app = FastAPI(title="CloudSyncContacts v0.2", version="0.2.0")
 init_db()
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def parse_iso_or_400(value: str, field_name: str) -> datetime:
+    try:
+        normalized = value.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"invalid {field_name}") from exc
 
 
 def _b64url(data: bytes) -> str:
@@ -141,6 +178,47 @@ def contact_fingerprint(contact: ContactIn) -> str:
     }
     body = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(body).hexdigest()
+
+
+def sync_change_fingerprint(change: SyncChange) -> str:
+    data = {
+        "display_name": change.display_name,
+        "given_name": change.given_name,
+        "family_name": change.family_name,
+        "phone_numbers": change.phone_numbers,
+        "email_addresses": change.email_addresses,
+        "postal_addresses": change.postal_addresses,
+        "organization": change.organization,
+        "job_title": change.job_title,
+        "notes": change.notes,
+        "source_device_id": change.source_device_id,
+    }
+    body = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(body).hexdigest()
+
+
+def serialize_contact(row: sqlite3.Row) -> Dict[str, Any]:
+    return {
+        "contact_id": row["contact_id"],
+        "local_id": row["local_id"],
+        "display_name": row["display_name"],
+        "given_name": row["given_name"],
+        "family_name": row["family_name"],
+        "phone_numbers": json.loads(row["phone_numbers"] or "[]"),
+        "email_addresses": json.loads(row["email_addresses"] or "[]"),
+        "postal_addresses": json.loads(row["postal_addresses"] or "[]"),
+        "organization": row["organization"],
+        "job_title": row["job_title"],
+        "notes": row["notes"],
+        "photo_uri": row["photo_uri"],
+        "source_device_id": row["source_device_id"],
+        "version": row["version"],
+        "sync_status": row["sync_status"],
+        "hash": row["hash"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "deleted_at": row["deleted_at"],
+    }
 
 
 def get_current_user_id(authorization: str = Header(default="")) -> str:
@@ -328,30 +406,226 @@ def list_contacts(
 
     items = []
     for row in rows:
-        items.append(
-            {
-                "contact_id": row["contact_id"],
-                "local_id": row["local_id"],
-                "display_name": row["display_name"],
-                "given_name": row["given_name"],
-                "family_name": row["family_name"],
-                "phone_numbers": json.loads(row["phone_numbers"] or "[]"),
-                "email_addresses": json.loads(row["email_addresses"] or "[]"),
-                "postal_addresses": json.loads(row["postal_addresses"] or "[]"),
-                "organization": row["organization"],
-                "job_title": row["job_title"],
-                "notes": row["notes"],
-                "photo_uri": row["photo_uri"],
-                "source_device_id": row["source_device_id"],
-                "version": row["version"],
-                "sync_status": row["sync_status"],
-                "hash": row["hash"],
-                "created_at": row["created_at"],
-                "updated_at": row["updated_at"],
-            }
-        )
+        items.append(serialize_contact(row))
 
     return {"page": page, "page_size": page_size, "total": total, "items": items}
+
+
+@app.post("/api/v1/sync")
+def sync_contacts(body: SyncRequest, user_id: str = Depends(get_current_user_id)) -> Dict[str, Any]:
+    last_sync_time = parse_iso_or_400(body.last_sync_time, "last_sync_time")
+    now = now_iso()
+    conflicts: List[Dict[str, Any]] = []
+    local_applied = {"created": 0, "updated": 0, "deleted": 0, "skipped": 0}
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        for change in body.local_changes:
+            cur.execute(
+                "SELECT * FROM contacts WHERE user_id = ? AND local_id = ?",
+                (user_id, change.local_id),
+            )
+            existing = cur.fetchone()
+            is_server_newer = False
+            if existing is not None:
+                is_server_newer = parse_iso_or_400(existing["updated_at"], "updated_at") > last_sync_time
+
+            if change.op == "delete":
+                if existing is None or existing["deleted_at"] is not None:
+                    local_applied["skipped"] += 1
+                    continue
+                if is_server_newer:
+                    conflicts.append(
+                        {
+                            "local_id": change.local_id,
+                            "type": "delete-modify",
+                            "server": serialize_contact(existing),
+                        }
+                    )
+                    continue
+                cur.execute(
+                    """
+                    UPDATE contacts
+                    SET deleted_at = ?, updated_at = ?, sync_status = ?, source_device_id = ?
+                    WHERE contact_id = ?
+                    """,
+                    (now, now, "synced", body.device_id, existing["contact_id"]),
+                )
+                local_applied["deleted"] += 1
+                continue
+
+            hash_value = sync_change_fingerprint(change)
+            if existing is None:
+                cur.execute(
+                    """
+                    INSERT INTO contacts (
+                        contact_id, user_id, display_name, given_name, family_name,
+                        phone_numbers, email_addresses, postal_addresses,
+                        organization, job_title, notes, photo_uri,
+                        source_device_id, local_id, version, sync_status,
+                        hash, created_at, updated_at, deleted_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        user_id,
+                        change.display_name,
+                        change.given_name,
+                        change.family_name,
+                        json.dumps(change.phone_numbers, ensure_ascii=False),
+                        json.dumps(change.email_addresses, ensure_ascii=False),
+                        json.dumps(change.postal_addresses, ensure_ascii=False),
+                        change.organization,
+                        change.job_title,
+                        change.notes,
+                        "",
+                        change.source_device_id or body.device_id,
+                        change.local_id,
+                        1,
+                        "synced",
+                        hash_value,
+                        now,
+                        now,
+                    ),
+                )
+                local_applied["created"] += 1
+                continue
+
+            # If server has newer and changed content, defer to v0.3 conflict flow.
+            if is_server_newer and existing["hash"] != hash_value and existing["deleted_at"] is None:
+                conflicts.append(
+                    {
+                        "local_id": change.local_id,
+                        "type": "value-conflict",
+                        "server": serialize_contact(existing),
+                    }
+                )
+                continue
+
+            if existing["hash"] == hash_value and existing["deleted_at"] is None:
+                local_applied["skipped"] += 1
+                continue
+
+            cur.execute(
+                """
+                UPDATE contacts
+                SET display_name = ?, given_name = ?, family_name = ?,
+                    phone_numbers = ?, email_addresses = ?, postal_addresses = ?,
+                    organization = ?, job_title = ?, notes = ?,
+                    source_device_id = ?, version = ?, sync_status = ?, hash = ?,
+                    updated_at = ?, deleted_at = NULL
+                WHERE contact_id = ?
+                """,
+                (
+                    change.display_name,
+                    change.given_name,
+                    change.family_name,
+                    json.dumps(change.phone_numbers, ensure_ascii=False),
+                    json.dumps(change.email_addresses, ensure_ascii=False),
+                    json.dumps(change.postal_addresses, ensure_ascii=False),
+                    change.organization,
+                    change.job_title,
+                    change.notes,
+                    change.source_device_id or body.device_id,
+                    int(existing["version"]) + 1,
+                    "synced",
+                    hash_value,
+                    now,
+                    existing["contact_id"],
+                ),
+            )
+            local_applied["updated"] += 1
+
+        cur.execute(
+            """
+            SELECT *
+            FROM contacts
+            WHERE user_id = ?
+              AND updated_at > ?
+              AND (source_device_id IS NULL OR source_device_id != ?)
+            ORDER BY updated_at ASC
+            """,
+            (user_id, last_sync_time.isoformat(), body.device_id),
+        )
+        server_rows = cur.fetchall()
+        server_changes = []
+        for row in server_rows:
+            payload = serialize_contact(row)
+            payload["op"] = "delete" if row["deleted_at"] else "upsert"
+            server_changes.append(payload)
+
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "server_changes": server_changes,
+        "conflicts": conflicts,
+        "local_applied": local_applied,
+        "sync_time": now,
+    }
+
+
+@app.get("/api/v1/sync/changes")
+def get_sync_changes(
+    since: str = Query(...),
+    device_id: Optional[str] = Query(default=None),
+    user_id: str = Depends(get_current_user_id),
+) -> Dict[str, Any]:
+    since_time = parse_iso_or_400(since, "since")
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        if device_id:
+            cur.execute(
+                """
+                SELECT *
+                FROM contacts
+                WHERE user_id = ?
+                  AND updated_at > ?
+                  AND (source_device_id IS NULL OR source_device_id != ?)
+                ORDER BY updated_at ASC
+                """,
+                (user_id, since_time.isoformat(), device_id),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT *
+                FROM contacts
+                WHERE user_id = ? AND updated_at > ?
+                ORDER BY updated_at ASC
+                """,
+                (user_id, since_time.isoformat()),
+            )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    changes = []
+    for row in rows:
+        item = serialize_contact(row)
+        item["op"] = "delete" if row["deleted_at"] else "upsert"
+        changes.append(item)
+    return {"changes": changes, "since": since_time.isoformat(), "count": len(changes)}
+
+
+@app.post("/api/v1/sync/ack")
+def sync_ack(body: SyncAckRequest, user_id: str = Depends(get_current_user_id)) -> Dict[str, str]:
+    acked_until = parse_iso_or_400(body.acked_until, "acked_until").isoformat()
+    created_at = now_iso()
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO sync_ack_log (ack_id, user_id, device_id, acked_until, created_at) VALUES (?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), user_id, body.device_id, acked_until, created_at),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "acknowledged", "acked_until": acked_until}
 
 
 @app.post("/api/v1/contacts/{contact_id}/photo")
