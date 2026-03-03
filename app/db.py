@@ -1,0 +1,57 @@
+import sqlite3
+from pathlib import Path
+
+DB_PATH = Path(__file__).resolve().parent.parent / "contactsync.db"
+
+
+def get_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id TEXT PRIMARY KEY,
+                email TEXT UNIQUE,
+                phone TEXT UNIQUE,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS contacts (
+                contact_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                display_name TEXT,
+                given_name TEXT,
+                family_name TEXT,
+                phone_numbers TEXT,
+                email_addresses TEXT,
+                postal_addresses TEXT,
+                organization TEXT,
+                job_title TEXT,
+                notes TEXT,
+                photo_uri TEXT,
+                source_device_id TEXT,
+                local_id TEXT,
+                version INTEGER NOT NULL DEFAULT 1,
+                sync_status TEXT NOT NULL DEFAULT 'synced',
+                hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                deleted_at TEXT,
+                UNIQUE(user_id, local_id)
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
