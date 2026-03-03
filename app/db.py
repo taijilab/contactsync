@@ -1,11 +1,115 @@
+import os
+import re
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 DB_PATH = Path(__file__).resolve().parent.parent / "contactsync.db"
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+# Type aliases for main.py to use instead of sqlite3.Cursor / sqlite3.Row
+Cursor = Any
+Row = Any
+
+_pg_pool = None
+
+_INSERT_OR_IGNORE_RE = re.compile(r"INSERT\s+OR\s+IGNORE\s+INTO", re.IGNORECASE)
 
 
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+def _is_postgres() -> bool:
+    return DATABASE_URL.startswith("postgresql://")
+
+
+def _init_pg_pool():
+    global _pg_pool
+    if _pg_pool is None:
+        from psycopg2 import pool
+
+        _pg_pool = pool.SimpleConnectionPool(2, 20, DATABASE_URL)
+
+
+def _translate_sql(sql: str) -> str:
+    """Convert SQLite SQL dialect to PostgreSQL.
+
+    - ``?`` placeholders become ``%s``
+    - ``INSERT OR IGNORE INTO`` becomes ``INSERT INTO … ON CONFLICT DO NOTHING``
+    """
+    needs_on_conflict = bool(_INSERT_OR_IGNORE_RE.search(sql))
+    if needs_on_conflict:
+        sql = _INSERT_OR_IGNORE_RE.sub("INSERT INTO", sql)
+
+    sql = sql.replace("?", "%s")
+
+    if needs_on_conflict:
+        sql = sql.rstrip().rstrip(";")
+        sql += " ON CONFLICT DO NOTHING"
+
+    return sql
+
+
+class _PgCursorWrapper:
+    """Wraps a psycopg2 RealDictCursor, translating ``?`` → ``%s``."""
+
+    def __init__(self, real_cursor):
+        self._cur = real_cursor
+
+    def execute(self, sql: str, params=None):
+        translated = _translate_sql(sql)
+        self._cur.execute(translated, params)
+
+    def fetchone(self):
+        return self._cur.fetchone()
+
+    def fetchall(self):
+        return self._cur.fetchall()
+
+
+class _PgConnectionWrapper:
+    """Wraps a psycopg2 connection to mimic the sqlite3.Connection interface.
+
+    * ``cursor()`` returns a ``_PgCursorWrapper`` backed by ``RealDictCursor``
+      so that ``row["col"]`` works identically to sqlite3.Row.
+    * ``commit()`` re-raises ``psycopg2.IntegrityError`` as
+      ``sqlite3.IntegrityError`` so callers in main.py need no changes.
+    * ``close()`` returns the connection to the pool instead of destroying it.
+    """
+
+    def __init__(self, raw_conn):
+        self._conn = raw_conn
+
+    def cursor(self):
+        from psycopg2.extras import RealDictCursor
+
+        return _PgCursorWrapper(self._conn.cursor(cursor_factory=RealDictCursor))
+
+    def commit(self):
+        try:
+            self._conn.commit()
+        except Exception as e:
+            import psycopg2
+
+            if isinstance(e, psycopg2.IntegrityError):
+                self._conn.rollback()
+                raise sqlite3.IntegrityError(str(e)) from e
+            raise
+
+    def close(self):
+        global _pg_pool
+        if _pg_pool and self._conn and not self._conn.closed:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+            _pg_pool.putconn(self._conn)
+
+
+def get_conn():
+    """Return a database connection (SQLite or PostgreSQL depending on env)."""
+    if _is_postgres():
+        _init_pg_pool()
+        raw = _pg_pool.getconn()
+        return _PgConnectionWrapper(raw)
+    conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     return conn
 

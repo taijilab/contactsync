@@ -21,7 +21,8 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field, model_validator
 from PIL import Image
 
-from app.db import get_conn, init_db
+from app.db import get_conn, init_db, Cursor, Row
+from app.cache import cache_get, cache_set, cache_delete
 
 APP_SECRET = os.getenv("APP_SECRET", "dev-secret-change-me")
 TOKEN_TTL_SECONDS = int(os.getenv("TOKEN_TTL_SECONDS", "86400"))
@@ -135,7 +136,6 @@ def now_iso() -> str:
 @app.middleware("http")
 async def metrics_middleware(request: Request, call_next):
     start = time.perf_counter()
-    key = f"{request.method} {request.url.path}"
     status_code = 500
     try:
         response = await call_next(request)
@@ -143,6 +143,11 @@ async def metrics_middleware(request: Request, call_next):
         return response
     finally:
         elapsed_ms = (time.perf_counter() - start) * 1000.0
+        route = request.scope.get("route")
+        if route and hasattr(route, "path"):
+            key = f"{request.method} {route.path}"
+        else:
+            key = f"{request.method} {request.url.path}"
         METRICS[key]["count"] += 1.0
         METRICS[key]["total_ms"] += elapsed_ms
         if status_code >= 400:
@@ -187,6 +192,15 @@ def create_token(user_id: str, token_type: str = "access", ttl_seconds: Optional
 
 
 def verify_token(token: str) -> Dict[str, Any]:
+    cache_key = f"tok:{token[-16:]}"
+    cached = cache_get(cache_key)
+    if cached:
+        payload = json.loads(cached)
+        if int(payload.get("exp", 0)) < int(datetime.now(timezone.utc).timestamp()):
+            cache_delete(cache_key)
+            raise HTTPException(status_code=401, detail="token expired")
+        return payload
+
     try:
         header_b64, payload_b64, sig_b64 = token.split(".")
     except ValueError as exc:
@@ -201,6 +215,10 @@ def verify_token(token: str) -> Dict[str, Any]:
     payload = json.loads(_b64url_decode(payload_b64).decode("utf-8"))
     if int(payload.get("exp", 0)) < int(datetime.now(timezone.utc).timestamp()):
         raise HTTPException(status_code=401, detail="token expired")
+
+    remaining = int(payload.get("exp", 0)) - int(datetime.now(timezone.utc).timestamp())
+    ttl = min(60, max(1, remaining))
+    cache_set(cache_key, json.dumps(payload), ttl_seconds=ttl)
     return payload
 
 
@@ -208,7 +226,7 @@ def token_digest(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-def issue_refresh_token(cur: sqlite3.Cursor, user_id: str, created_at: str) -> str:
+def issue_refresh_token(cur: Cursor, user_id: str, created_at: str) -> str:
     refresh_token = create_token(user_id, token_type="refresh", ttl_seconds=REFRESH_TOKEN_TTL_SECONDS)
     cur.execute(
         """
@@ -275,7 +293,7 @@ def sync_change_fingerprint(change: SyncChange) -> str:
     return hashlib.sha256(body).hexdigest()
 
 
-def serialize_contact(row: sqlite3.Row) -> Dict[str, Any]:
+def serialize_contact(row: Row) -> Dict[str, Any]:
     return {
         "contact_id": row["contact_id"],
         "local_id": row["local_id"],
@@ -299,7 +317,7 @@ def serialize_contact(row: sqlite3.Row) -> Dict[str, Any]:
     }
 
 
-def row_to_sync_change(row: sqlite3.Row, op_override: Optional[str] = None) -> Dict[str, Any]:
+def row_to_sync_change(row: Row, op_override: Optional[str] = None) -> Dict[str, Any]:
     payload = {
         "op": op_override or ("delete" if row["deleted_at"] else "upsert"),
         "local_id": row["local_id"],
@@ -317,7 +335,7 @@ def row_to_sync_change(row: sqlite3.Row, op_override: Optional[str] = None) -> D
     return payload
 
 
-def write_contact_history(cur: sqlite3.Cursor, row: sqlite3.Row, user_id: str, created_at: str) -> None:
+def write_contact_history(cur: Cursor, row: Row, user_id: str, created_at: str) -> None:
     snapshot = serialize_contact(row)
     cur.execute(
         """
@@ -336,7 +354,7 @@ def write_contact_history(cur: sqlite3.Cursor, row: sqlite3.Row, user_id: str, c
 
 
 def insert_conflict(
-    cur: sqlite3.Cursor,
+    cur: Cursor,
     user_id: str,
     local_id: str,
     contact_id: Optional[str],
@@ -496,7 +514,7 @@ def get_current_user_id(authorization: str = Header(default="")) -> str:
 
 
 def write_audit(
-    cur: sqlite3.Cursor,
+    cur: Cursor,
     action: str,
     user_id: Optional[str] = None,
     target_type: Optional[str] = None,
@@ -706,6 +724,7 @@ def batch_upload(body: BatchUploadRequest, user_id: str = Depends(get_current_us
             metadata={"created": created, "updated": updated, "total": len(body.contacts)},
         )
         conn.commit()
+        cache_delete(f"cnt:{user_id}")
     finally:
         conn.close()
 
@@ -728,8 +747,14 @@ def list_contacts(
     conn = get_conn()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) AS total FROM contacts WHERE user_id = ? AND deleted_at IS NULL", (user_id,))
-        total = int(cur.fetchone()["total"])
+        cnt_key = f"cnt:{user_id}"
+        cached_total = cache_get(cnt_key)
+        if cached_total is not None:
+            total = int(cached_total)
+        else:
+            cur.execute("SELECT COUNT(*) AS total FROM contacts WHERE user_id = ? AND deleted_at IS NULL", (user_id,))
+            total = int(cur.fetchone()["total"])
+            cache_set(cnt_key, str(total), ttl_seconds=30)
 
         cur.execute(
             """
@@ -910,6 +935,7 @@ def sync_contacts(body: SyncRequest, user_id: str = Depends(get_current_user_id)
             server_changes.append(payload)
 
         conn.commit()
+        cache_delete(f"cnt:{user_id}")
     finally:
         conn.close()
 
@@ -1165,6 +1191,7 @@ def resolve_conflict(
             metadata={"strategy": body.strategy},
         )
         conn.commit()
+        cache_delete(f"cnt:{user_id}")
     finally:
         conn.close()
 
@@ -1273,6 +1300,7 @@ def rollback_contact(
             metadata={"history_id": body.history_id},
         )
         conn.commit()
+        cache_delete(f"cnt:{user_id}")
     finally:
         conn.close()
     return {"status": "rolled_back", "contact_id": contact_id, "history_id": body.history_id}
@@ -1302,8 +1330,43 @@ def dedupe_candidates(
         conn.close()
 
     contacts = [serialize_contact(row) for row in rows]
+
+    # Build inverted indexes for blocking (avoids O(n^2) full comparison)
+    phone_index: Dict[str, set] = defaultdict(set)
+    email_index: Dict[str, set] = defaultdict(set)
+    for i, c in enumerate(contacts):
+        for item in c.get("phone_numbers", []):
+            norm = normalize_phone(str(item.get("value", "")))
+            if norm:
+                phone_index[norm].add(i)
+        for item in c.get("email_addresses", []):
+            raw = str(item.get("value", "")).strip().lower()
+            if raw:
+                email_index[raw].add(i)
+
+    # Collect candidate pairs: only those sharing at least one phone or email
+    candidate_pairs: set = set()
+    for indices in phone_index.values():
+        idx_list = sorted(indices)
+        for a in range(len(idx_list)):
+            for b in range(a + 1, len(idx_list)):
+                candidate_pairs.add((idx_list[a], idx_list[b]))
+    for indices in email_index.values():
+        idx_list = sorted(indices)
+        for a in range(len(idx_list)):
+            for b in range(a + 1, len(idx_list)):
+                candidate_pairs.add((idx_list[a], idx_list[b]))
+
+    # For very low thresholds, name-only matches could qualify (max without
+    # phone/email = 0.2*100 + 0.1*100 = 30), so fall back to full comparison.
+    if min_score <= 30:
+        for i in range(len(contacts)):
+            for j in range(i + 1, len(contacts)):
+                candidate_pairs.add((i, j))
+
     candidates = []
-    for left, right in itertools.combinations(contacts, 2):
+    for i, j in candidate_pairs:
+        left, right = contacts[i], contacts[j]
         key = pair_key(left["local_id"], right["local_id"])
         if key in ignored:
             continue
@@ -1465,6 +1528,7 @@ def dedupe_merge(body: DedupeMergeRequest, user_id: str = Depends(get_current_us
             metadata={"merged_count": deleted_count + 1},
         )
         conn.commit()
+        cache_delete(f"cnt:{user_id}")
     finally:
         conn.close()
 

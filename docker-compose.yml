@@ -12,6 +12,8 @@ services:
       - APP_SECRET=dev-secret-change-me
       - TOKEN_TTL_SECONDS=86400
       - REFRESH_TOKEN_TTL_SECONDS=2592000
+      - DATABASE_URL=postgresql://contactsync:contactsync@postgres:5432/contactsync
+      - REDIS_URL=redis://redis:6379/0
     depends_on:
       - postgres
       - redis
